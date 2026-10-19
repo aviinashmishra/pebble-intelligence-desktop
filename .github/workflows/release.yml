@@ -1,0 +1,110 @@
+# Builds the Pebble Intelligence desktop app from its (private) source and publishes the installers here.
+# Actions → Release → Run workflow: source = a tag in Pebble-Intelligence (e.g. desktop-v1.2.1), version = 1.2.1.
+#
+# The source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY). Installers are client-only:
+# the app connects to the company's live Pebble and contains no server code.
+# Optional signing secrets: CSC_LINK / CSC_KEY_PASSWORD (Windows .pfx), MAC_CSC_LINK / MAC_CSC_KEY_PASSWORD (macOS .p12).
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Tag or branch in Pebble-Intelligence to build
+        required: true
+        default: main
+      version:
+        description: Version to publish (e.g. 1.2.1)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: --win }
+          - { os: macos-latest, target: --mac }
+          - { os: ubuntu-latest, target: --linux }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults: { run: { shell: bash, working-directory: src/Desktop } }
+    steps:
+      - name: Check the version
+        working-directory: .
+        run: '[[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Version must look like 1.2.3"; exit 1; }'
+      - uses: actions/checkout@v4
+        with:
+          repository: aviinashmishra/Pebble-Intelligence
+          ref: ${{ inputs.source }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: src/.node-version
+          cache: npm
+          cache-dependency-path: src/Desktop/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+      - run: node scripts/prepare-server.js --client-only
+      - name: Build
+        env:
+          WIN_CSC: ${{ secrets.CSC_LINK }}
+          WIN_CSC_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          MAC_CSC: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: |
+          if [ "${{ matrix.target }}" = "--win" ] && [ -n "$WIN_CSC" ]; then export CSC_LINK="$WIN_CSC" CSC_KEY_PASSWORD="$WIN_CSC_PASSWORD"
+          elif [ "${{ matrix.target }}" = "--mac" ] && [ -n "$MAC_CSC" ]; then export CSC_LINK="$MAC_CSC" CSC_KEY_PASSWORD="$MAC_CSC_PASSWORD"
+          else export CSC_IDENTITY_AUTO_DISCOVERY=false; fi
+          npx electron-builder ${{ matrix.target }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: |
+            src/Desktop/dist/*.exe
+            src/Desktop/dist/*.dmg
+            src/Desktop/dist/*.zip
+            src/Desktop/dist/*.AppImage
+            src/Desktop/dist/*.yml
+            src/Desktop/dist/*.blockmap
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          ls -la dist
+          rm -f dist/builder-debug.yml dist/builder-effective-config.yaml
+          cat > notes.md <<NOTES
+          Download the right file for your computer at **https://pebble.pebblecart.com/download** (or https://pebble-intelligence.vercel.app/download).
+
+          | Computer | File |
+          | --- | --- |
+          | Windows 10/11 | \`Pebble-Intelligence-Setup-${VERSION}.exe\` installs for you only (no admin rights) and updates itself. No install: the portable \`.exe\` or the \`-win-x64.zip\` |
+          | macOS (Apple silicon and Intel) | \`Pebble-Intelligence-${VERSION}-universal.dmg\` |
+          | Linux x64 | \`Pebble-Intelligence-${VERSION}-x86_64.AppImage\` (\`chmod +x\`, then run; updates itself) |
+
+          Sign in with your @pebblecart.com email. The app opens the company's live Pebble.
+
+          First run: if Windows says "Windows protected your PC", choose **More info → Run anyway**. On macOS, right-click Pebble → **Open** the first time.
+          NOTES
+          gh release create "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --target main --title "Pebble Intelligence ${VERSION}" --notes-file notes.md --latest
